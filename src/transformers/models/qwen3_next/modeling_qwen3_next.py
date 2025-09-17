@@ -21,9 +21,12 @@
 
 from typing import Any, Callable, Optional, Union
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+import torch.utils.checkpoint
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache
@@ -731,6 +734,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        g = 0. * g
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -858,6 +862,7 @@ class Qwen3NextDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3NextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         # token mixer
         self.layer_type = config.layer_types[layer_idx]
@@ -912,7 +917,7 @@ class Qwen3NextDecoderLayer(GradientCheckpointingLayer):
                 into the model
         """
         residual = hidden_states
-
+        # logger.info(f'ln:{self.input_layernorm.weight}, hid.shape={hidden_states.shape}')
         hidden_states = self.input_layernorm(hidden_states)
 
         # Token Mixer
@@ -965,20 +970,64 @@ class Qwen3NextPreTrainedModel(PreTrainedModel):
     }
     _is_stateful = True
 
+    # def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+    #     if not gradient_checkpointing_kwargs:
+    #         gradient_checkpointing_kwargs = {'use_reentrant': False}
+    #     super().gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+
     def _init_weights(self, module):
+        self.config.initializer_range = math.sqrt(0.3333 / self.config.hidden_size)
+        factor = math.sqrt(2 * self.config.num_hidden_layers)
         super()._init_weights(module)
+
+        logger.info(f'apply constom init to {module}, factor={factor}, range={self.config.initializer_range}')
+        if isinstance(module, Qwen3NextAttention):
+            module.o_proj.weight.data.div_(factor)
+
+        if isinstance(module, Qwen3NextRMSNorm):
+            module.weight.data.fill_(0)
+
         if isinstance(module, Qwen3NextGatedDeltaNet):
             module.dt_bias.data.fill_(1.0)
             module.A_log.data.uniform_(0, 16).log_()
+            module.out_proj.weight.data.div_(factor)
 
 
 class Qwen3NextModel(Qwen3NextPreTrainedModel):
+    def forward_nan_hook(self, module, inputs, output):
+        for input in inputs:
+            if torch.isnan(input).any():
+                idx = torch.nonzero(torch.isnan(input), as_tuple=False)[0]
+                logger.info(f"[FORWARD-input],shape={input.shape} NaN in {module.__class__.__name__}, layer-idx={module.layer_idx}, first index: {idx.tolist()}")
+                raise ValueError("NaN detected in forward!")    
+
+        if torch.isnan(output).any():
+            idx = torch.nonzero(torch.isnan(output), as_tuple=False)[0]
+            logger.info(f"[FORWARD-output] NaN in {module.__class__.__name__}, layer-idx={module.layer_idx}, first index: {idx.tolist()}")
+            for n, p in module.named_parameters():
+                logger.info(f'module param nan: {n}: hasnan={p.isnan().any().item()}')
+            raise ValueError("NaN detected in forward!")    
+    
+    def create_nan_hook(self, n):
+        def hook(grad):
+            if torch.isnan(grad).any():
+                idx = torch.nonzero(torch.isnan(grad), as_tuple=False)[0]
+                logger.info(f"[BACKWARD] NaN in gradient,")
+                raise ValueError("NaN detected in backward!")
+            return grad
+        return hook
+
     def __init__(self, config: Qwen3NextConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        logger.info(f'qwen3-next using layer type: {config.layer_types}')
         self.layers = nn.ModuleList(
             [Qwen3NextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        for l in self.layers:
+            l.register_forward_hook(self.forward_nan_hook)
+            for n, p in l.named_parameters():
+                p.register_hook(self.create_nan_hook(n))
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3NextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -1031,6 +1080,7 @@ class Qwen3NextModel(Qwen3NextPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            # logger.info(f'decoder-layer:{decoder_layer._gradient_checkpointing_func}')
             layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
 
             hidden_states = decoder_layer(
@@ -1206,6 +1256,7 @@ class Qwen3NextForCausalLM(Qwen3NextPreTrainedModel, GenerationMixin):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        # logger.info(f'fwd model, hid:{input_ids.shape}, recom={self.model.gradient_checkpointing}')
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: MoeModelOutputWithPast = self.model(
@@ -1214,7 +1265,7 @@ class Qwen3NextForCausalLM(Qwen3NextPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
+            use_cache=False,
             output_router_logits=output_router_logits,
             cache_position=cache_position,
             **kwargs,
