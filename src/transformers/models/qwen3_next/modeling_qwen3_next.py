@@ -734,7 +734,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        g = 0. * g
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -917,7 +916,6 @@ class Qwen3NextDecoderLayer(GradientCheckpointingLayer):
                 into the model
         """
         residual = hidden_states
-        # logger.info(f'ln:{self.input_layernorm.weight}, hid.shape={hidden_states.shape}')
         hidden_states = self.input_layernorm(hidden_states)
 
         # Token Mixer
@@ -1024,10 +1022,10 @@ class Qwen3NextModel(Qwen3NextPreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3NextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        for l in self.layers:
-            l.register_forward_hook(self.forward_nan_hook)
-            for n, p in l.named_parameters():
-                p.register_hook(self.create_nan_hook(n))
+        # for l in self.layers:
+        #     l.register_forward_hook(self.forward_nan_hook)
+        #     for n, p in l.named_parameters():
+        #         p.register_hook(self.create_nan_hook(n))
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3NextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
