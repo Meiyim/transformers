@@ -608,6 +608,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
         self.layer_norm_epsilon = config.rms_norm_eps
+        self.disable_gate_in_gdn = config.disable_gate_in_gdn
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -633,17 +634,25 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
-        self.norm = (
-            Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-            if FusedRMSNormGated is None
-            else FusedRMSNormGated(
-                self.head_v_dim,
-                eps=self.layer_norm_epsilon,
-                activation=self.activation,
-                device=torch.cuda.current_device(),
-                dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
+        if config.use_gated_rmsnorm:
+            self.norm = (
+                Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+                if FusedRMSNormGated is None
+                else FusedRMSNormGated(
+                    self.head_v_dim,
+                    eps=self.layer_norm_epsilon,
+                    activation=self.activation,
+                    device=torch.cuda.current_device(),
+                    dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),)
             )
-        )
+        else:
+            logger.info(f'faking `Qwen3NextRMSNormGated`')
+            class FakseQwen3NextRMSNormGated(Qwen3NextRMSNorm):
+                def forward(self, x, gate):
+                    x = Qwen3NextRMSNorm.forward(self, x)
+                    return x + gate * 0.
+            self.norm = FakseQwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
@@ -761,24 +770,37 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self.disable_gate_in_gdn:
+            fake = self.A_log.sum() * self.dt_bias.sum() * a.sum() * 0 # attach graph to random var
+            query = fake.view([1]*query.ndim).expand_as(query) * query
+            g = None
+        else:
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
+        
         if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if g is None and is_fast_path_available:
+                from fla.ops.delta_rule.chunk import chunk_delta_rule
+                core_attn_out, last_recurrent_state = chunk_delta_rule(
+                    query, key, value, beta,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            else:
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                )
 
         else:
+            raise NotImplemented
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
                 key,
