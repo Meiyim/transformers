@@ -20,7 +20,8 @@
 # limitations under the License.
 
 from typing import Any, Callable, Optional, Union
-
+from copy import deepcopy
+from functools import partial
 import math
 
 import torch
@@ -58,12 +59,8 @@ if is_causal_conv1d_available():
 else:
     causal_conv1d_update, causal_conv1d_fn = None, None
 
-if is_flash_linear_attention_available():
-    from fla.modules import FusedRMSNormGated
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-else:
-    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
-    FusedRMSNormGated = None
+from fla.modules import FusedRMSNormGated
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 logger = logging.get_logger(__name__)
 
@@ -442,7 +439,7 @@ def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
     return x * inv_norm
 
 
-def torch_chunk_gated_delta_rule(
+def torch_chunk_gated_delta_rule_ema(
     query,
     key,
     value,
@@ -459,12 +456,12 @@ def torch_chunk_gated_delta_rule(
         key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
+    ]       
 
-    batch_size, sequence_length, num_heads, k_head_dim = key.shape
+    batch_size, sequence_length, num_heads, k_head_dim = key.shape # actual is [B,h,S,d]
     v_head_dim = value.shape[-1]
     pad_size = (chunk_size - num_heads % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
+    query = F.pad(query, (0, 0, 0, pad_size)) #we are padding over seqlen
     key = F.pad(key, (0, 0, 0, pad_size))
     value = F.pad(value, (0, 0, 0, pad_size))
     beta = F.pad(beta, (0, pad_size))
@@ -479,40 +476,56 @@ def torch_chunk_gated_delta_rule(
     query, key, value, k_beta, v_beta = [
         x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
     ]
+    # value: [B,h,S/C,C,d]
+    # logger.info(f'value, shape: {value.shape}')
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
 
     # chunk decay
+    minuse_decay = (1 - g.exp()).float() # [B,h,S/C,C]
     g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    decay_mask = (
+        ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()) * minuse_decay[...,None]
+    ).tril()
+
+    attn = -(k_beta @ key.transpose(-1, -2)).masked_fill(mask, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = (
+    k_cumdecay = attn @ k_beta
+    assert initial_state is None
+    last_recurrent_state = ( #[B,h,k_head_dim,v_head_dim]
         torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
         if initial_state is None
         else initial_state.to(value)
     )
+    last_recurrent_state_ema = torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+    # logger.info(f'State-shape:{last_recurrent_state_ema.shape}')
     core_attn_out = torch.zeros_like(value)
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
 
     # for each chunk
+    # value [B,S,h,d]
     for i in range(0, tot_heads // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i] # [B,h,C,k_head_dim]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0) #  [B,h,C,d]@ [B,h,C,d] -> [B,num_head,C, C]
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state  # [B,num_head,C, v_head_dim]
+        v_new = v_i - v_prime # [B,num_head,C, v_head_dim]
+        attn_inter = q_i @ last_recurrent_state_ema # [B,num_head,C,v_head_dim]
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new # [B,num_head,C, v_head_dim]
+        last_recurrent_state = ( # [B, num_head, k_head_dim, v_head_dim]
+            last_recurrent_state 
+            + k_i.transpose(-1, -2) @ v_new
         )
+        last_recurrent_state_ema = (
+            last_recurrent_state_ema * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )# [1,1]-[C] ->[1,C]
+        # debug = (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)   #[B,h,C,C]
+        # logger.info(f'debug-shape: {debug.shape}')
 
     if not output_final_state:
         last_recurrent_state = None
@@ -594,7 +607,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         # projection of the input hidden states
-        projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        self.use_gated_rmsnorm = getattr(config, 'use_gated_rmsnorm', True)
+        self.use_gdn_ema = getattr(config, 'use_gdn_ema', False)
+        if self.use_gated_rmsnorm:
+            projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        else:
+            projection_size_qkvz = self.key_dim * 2 + self.value_dim 
+
         projection_size_ba = self.num_v_heads * 2
         self.in_proj_qkvz = nn.Linear(self.hidden_size, projection_size_qkvz, bias=False)
         self.in_proj_ba = nn.Linear(self.hidden_size, projection_size_ba, bias=False)
@@ -606,7 +625,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
-        if config.use_gated_rmsnorm:
+        if self.use_gated_rmsnorm:
             self.norm = (
                 Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
                 if FusedRMSNormGated is None
@@ -618,20 +637,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     dtype=config.dtype if config.dtype is not None else torch.get_current_dtype(),
                 )
             )
-        else:
-            logger.info(f'faking `Qwen3NextRMSNormGated`')
-            class FakseQwen3NextRMSNormGated(Qwen3NextRMSNorm):
-                def forward(self, x, gate):
-                    x = Qwen3NextRMSNorm.forward(self, x)
-                    return x + gate * 0.
-            self.norm = FakseQwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule #or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
@@ -670,6 +681,34 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         a = a.reshape(a.size(0), a.size(1), self.num_v_heads)
         return query, key, value, z, b, a
 
+
+    def fix_query_key_value_ordering_no_gate(self, mixed_qkvz, mixed_ba):
+        """
+        Derives `query`, `key` and `value` tensors from `mixed_qkvz` and `mixed_ba`.
+        """
+
+        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
+            self.num_k_heads,
+            2 * self.head_k_dim + self.head_v_dim * self.num_v_heads // self.num_k_heads,
+        )
+        new_tensor_shape_ba = mixed_ba.size()[:-1] + (self.num_k_heads, 2 * self.num_v_heads // self.num_k_heads)
+
+        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
+        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
+        split_arg_list_qkvz = [
+            self.head_k_dim,
+            self.head_k_dim,
+            (self.num_v_heads // self.num_k_heads * self.head_v_dim),         
+        ]
+        split_arg_list_ba = [self.num_v_heads // self.num_k_heads, self.num_v_heads // self.num_k_heads]
+        query, key, value = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=3)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=3)
+        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
+        value = value.reshape(value.size(0), value.size(1), -1, self.head_v_dim)
+        b = b.reshape(b.size(0), b.size(1), self.num_v_heads)
+        a = a.reshape(a.size(0), a.size(1), self.num_v_heads)
+        return query, key, value, b, a        
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -696,7 +735,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+        if self.use_gated_rmsnorm:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+        else:
+             query, key, value, b, a = self.fix_query_key_value_ordering_no_gate(projected_states_qkvz, projected_states_ba)
         query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
 
         mixed_qkv = torch.cat((query, key, value), dim=-1)
@@ -749,6 +791,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             g = None
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            # self.log(f'gdn/layer@{self.layer_idx}', g.exp())
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -758,6 +801,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 from fla.ops.delta_rule.chunk import chunk_delta_rule
                 core_attn_out, last_recurrent_state = chunk_delta_rule(
                     query, key, value, beta,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            elif self.use_gdn_ema:
+                logger.info(f'using gdn ema')
+                core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule_ema(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
                 )
             else:
@@ -789,12 +844,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
-        z_shape_og = z.shape
         # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
+        if self.use_gated_rmsnorm:
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z_shape_og = z.shape
+            z = z.reshape(-1, z.shape[-1])
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
 
         output = self.out_proj(core_attn_out)
@@ -1222,6 +1278,12 @@ class Qwen3NextForCausalLM(Qwen3NextPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    # def create_log_gate_hook(self, key):
+    #     def _hook(module, input, output):
+    #         _, gate = input
+    #         self.logable.setdefault(key, []).append(gate.to('cpu', non_blocking=True))
+    #     return _hook
 
     def __init__(self, config):
         super().__init__(config)
