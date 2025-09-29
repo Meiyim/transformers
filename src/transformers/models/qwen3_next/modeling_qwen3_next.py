@@ -482,6 +482,7 @@ def torch_chunk_gated_delta_rule_ema(
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
 
     # chunk decay
+    # g is ln(gate)
     minuse_decay = (1 - g.exp()).float() # [B,h,S/C,C]
     g = g.cumsum(dim=-1)
     decay_mask = (
@@ -520,9 +521,13 @@ def torch_chunk_gated_delta_rule_ema(
             last_recurrent_state 
             + k_i.transpose(-1, -2) @ v_new
         )
+        decay_mask_1d = (
+            (g[:, :, i, -1, None] - g[:, :, i]).exp()  #[g2...g{n}, g_{n-1}...g_n, g_n,0].exp()
+           * minuse_decay[:,:,i]
+        )
         last_recurrent_state_ema = (
             last_recurrent_state_ema * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            + (k_i * decay_mask_1d[..., None]).transpose(-1, -2) @ v_new
         )# [1,1]-[C] ->[1,C]
         # debug = (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)   #[B,h,C,C]
         # logger.info(f'debug-shape: {debug.shape}')
@@ -804,7 +809,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                 )
             elif self.use_gdn_ema:
-                logger.info(f'using gdn ema')
                 core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule_ema(
                     query,
                     key,
