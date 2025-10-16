@@ -62,6 +62,8 @@ else:
 from fla.modules import FusedRMSNormGated
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
+FusedRMSNormGated = None
+
 logger = logging.get_logger(__name__)
 
 
@@ -485,18 +487,21 @@ def torch_chunk_gated_delta_rule_ema(
     # g is ln(gate)
     minuse_decay = (1 - g.exp()).float() # [B,h,S/C,C]
     g = g.cumsum(dim=-1)
-    decay_mask = (
-        ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()) * minuse_decay.unsqueeze(-2)
-    ).tril() #[B,h,S/C,C,C]
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
 
-    attn = -(k_beta @ key.transpose(-1, -2)).masked_fill(mask, 0)
+    decay_mask_ema = (
+        ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()) * minuse_decay[...,None]
+    ).tril()
+    attn_ema = -(k_beta @ key.transpose(-1, -2)).masked_fill(mask, 0)
+
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
-    k_cumdecay = attn @ k_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     assert initial_state is None
     last_recurrent_state = ( #[B,h,k_head_dim,v_head_dim]
         torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
@@ -512,18 +517,23 @@ def torch_chunk_gated_delta_rule_ema(
     # value [B,S,h,d]
     for i in range(0, tot_heads // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i] # [B,h,C,k_head_dim]
-        attn = (q_i @ (decay_mask[:, :, i]@k_i).transpose(-1,-2)).masked_fill_(mask, 0) #  [B,h,C,d]@ [B,h,C,d] -> [B,num_head,C, C]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        attn_ema = (q_i @ k_i.transpose(-1, -2) * decay_mask_ema[:, :, i]).masked_fill_(mask, 0) #  [B,h,C,d]@ [B,h,C,d] -> [B,num_head,C, C]
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state  # [B,num_head,C, v_head_dim]
         v_new = v_i - v_prime # [B,num_head,C, v_head_dim]
-        attn_inter = q_i @ last_recurrent_state_ema # [B,num_head,C,v_head_dim]
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new # [B,num_head,C, v_head_dim]
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = ( # [B, num_head, k_head_dim, v_head_dim]
-            last_recurrent_state 
-            + k_i.transpose(-1, -2) @ v_new
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+        decay_mask_1d = (
+            (g[:, :, i, -1, None] - g[:, :, i]).exp()  #[g2...g{n}, g_{n-1}...g_n, g_n,0].exp()
+           * minuse_decay[:,:,i]
         )
         last_recurrent_state_ema = (
             last_recurrent_state_ema * g[:, :, i, -1, None, None].exp()
-            + (k_i * decay_mask[:,:,i,-1].unsqueeze(-1)).transpose(-1, -2) @ v_new
+            + (k_i * decay_mask_1d[..., None]).transpose(-1, -2) @ v_new
         )# [1,1]-[C] ->[1,C]
         # debug = (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)   #[B,h,C,C]
         # logger.info(f'debug-shape: {debug.shape}')
