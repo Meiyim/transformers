@@ -454,9 +454,11 @@ def torch_chunk_gated_delta_rule_ema(
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]       
+    query, key, value, beta = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta)
+    ]      
+    # [B,S,#state,num_heads]  -> [B, num_heads, #state, S]
+    g = g.transpose(1,3).contiguous().to(torch.float32)
 
     batch_size, sequence_length, num_heads, k_head_dim = key.shape # actual is [B,h,S,d]
     v_head_dim = value.shape[-1]
@@ -478,16 +480,16 @@ def torch_chunk_gated_delta_rule_ema(
     ]
     # value: [B,h,S/C,C,d]
     # logger.info(f'value, shape: {value.shape}')
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    g = g.reshape(g.shape[0], g.shape[1], g.shape[2], -1, chunk_size,) #[B,#heads,#state,S//C,C]
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
 
     # chunk decay
     # g is ln(gate)
-    minuse_decay = (1 - g.exp()).float() # [B,h,S/C,C]
+    minuse_decay = (1 - g.exp()).float() #[B,#heads,#state,S//C,C]
     g = g.cumsum(dim=-1)
     decay_mask = (
         ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()) * minuse_decay.unsqueeze(-2)
-    ).tril() #[B,h,S/C,C,C]
+    ).tril().mean(2) #[B,h,S/C,C,C]
 
     attn = -(k_beta @ key.transpose(-1, -2)).masked_fill(mask, 0)
     for i in range(1, chunk_size):
@@ -511,7 +513,7 @@ def torch_chunk_gated_delta_rule_ema(
     # for each chunk
     # value [B,S,h,d]
     for i in range(0, tot_heads // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i] # [B,h,C,k_head_dim]
+        q_i, k_i, v_i = query[:, :,  i], key[:, :,  i], value[:, :, i] # [B,h,C,k_head_dim]
         attn = (q_i @ (decay_mask[:, :, i]@k_i).transpose(-1,-2)).masked_fill_(mask, 0) #  [B,h,C,d]@ [B,h,C,d] -> [B,num_head,C, C]
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state  # [B,num_head,C, v_head_dim]
         v_new = v_i - v_prime # [B,num_head,C, v_head_dim]
@@ -522,7 +524,7 @@ def torch_chunk_gated_delta_rule_ema(
             + k_i.transpose(-1, -2) @ v_new
         )
         last_recurrent_state_ema = (
-            last_recurrent_state_ema * g[:, :, i, -1, None, None].exp()
+            last_recurrent_state_ema * g[:, :, :, i, -1, None, None].exp().mean(2)
             + (k_i * decay_mask[:,:,i,-1].unsqueeze(-1)).transpose(-1, -2) @ v_new
         )# [1,1]-[C] ->[1,C]
         # debug = (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)   #[B,h,C,C]
@@ -595,6 +597,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.act = ACT2FN[config.hidden_act]
         self.layer_norm_epsilon = config.rms_norm_eps
         self.disable_gate_in_gdn = config.disable_gate_in_gdn
+        self.num_state = getattr(config, 'num_state', 1)
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -615,15 +618,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         else:
             projection_size_qkvz = self.key_dim * 2 + self.value_dim 
 
-        projection_size_ba = self.num_v_heads * 2
+        projection_size_ba = (self.num_state) * self.num_v_heads +  self.num_v_heads
         self.in_proj_qkvz = nn.Linear(self.hidden_size, projection_size_qkvz, bias=False)
         self.in_proj_ba = nn.Linear(self.hidden_size, projection_size_ba, bias=False)
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.dt_bias = nn.Parameter(torch.ones(self.num_state, self.num_v_heads))
 
-        A = torch.empty(self.num_v_heads).uniform_(0, 16)
+        A = torch.empty(self.num_state, self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
         if self.use_gated_rmsnorm:
@@ -653,7 +656,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 " https://github.com/Dao-AILab/causal-conv1d"
             )
 
-    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
+    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba, num_state: int):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvz` and `mixed_ba`.
         """
@@ -662,7 +665,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.num_k_heads,
             2 * self.head_k_dim + 2 * self.head_v_dim * self.num_v_heads // self.num_k_heads,
         )
-        new_tensor_shape_ba = mixed_ba.size()[:-1] + (self.num_k_heads, 2 * self.num_v_heads // self.num_k_heads)
+        new_tensor_shape_ba = mixed_ba.size()[:-1] + (self.num_k_heads,
+             self.num_v_heads // self.num_k_heads + 
+             num_state * self.num_v_heads // self.num_k_heads
+        )
 
         mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
         mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
@@ -672,14 +678,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             (self.num_v_heads // self.num_k_heads * self.head_v_dim),
             (self.num_v_heads // self.num_k_heads * self.head_v_dim),
         ]
-        split_arg_list_ba = [self.num_v_heads // self.num_k_heads, self.num_v_heads // self.num_k_heads]
+        split_arg_list_ba = [
+            self.num_v_heads // self.num_k_heads, 
+            num_state * self.num_v_heads // self.num_k_heads
+        ]
         query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=3)
         b, a = torch.split(mixed_ba, split_arg_list_ba, dim=3)
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), value.size(1), -1, self.head_v_dim)
         z = z.reshape(z.size(0), z.size(1), -1, self.head_v_dim)
         b = b.reshape(b.size(0), b.size(1), self.num_v_heads)
-        a = a.reshape(a.size(0), a.size(1), self.num_v_heads)
+        a = a.reshape(a.size(0), a.size(1), num_state, self.num_v_heads)
         return query, key, value, z, b, a
 
 
@@ -737,7 +746,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         if self.use_gated_rmsnorm:
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba, self.num_state)
         else:
              query, key, value, b, a = self.fix_query_key_value_ordering_no_gate(projected_states_qkvz, projected_states_ba)
         query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
@@ -793,6 +802,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
             # self.log(f'gdn/layer@{self.layer_idx}', g.exp())
+
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
