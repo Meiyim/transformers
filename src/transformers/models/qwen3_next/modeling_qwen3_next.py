@@ -191,8 +191,10 @@ class Qwen3NextRotaryEmbedding(nn.Module):
 
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        logger.info(f'rope init fn: {self.rope_init_fn}')
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        logger.info(f'initialized freq: {inv_freq.shape}')
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -329,9 +331,13 @@ class Qwen3NextAttention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        self.use_gated_rmsnorm = config.use_gated_rmsnorm
         self.is_causal = True
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
+            config.hidden_size, 
+                (config.num_attention_heads * self.head_dim * 2) if self.use_gated_rmsnorm else  
+                (config.num_attention_heads * self.head_dim) , 
+            bias=config.attention_bias
         )
         self.k_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
@@ -360,10 +366,15 @@ class Qwen3NextAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
-        )
-        gate = gate.reshape(*input_shape, -1)
+        if self.use_gated_rmsnorm:
+            query_states, gate = torch.chunk(
+                self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+            )
+            gate = gate.reshape(*input_shape, -1)
+        else:
+            query_states = self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim )
+            gate = None
+                
 
         query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -393,7 +404,8 @@ class Qwen3NextAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = attn_output * torch.sigmoid(gate)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
