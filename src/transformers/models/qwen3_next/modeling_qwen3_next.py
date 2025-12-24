@@ -358,6 +358,9 @@ class Qwen3NextAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.use_gated_rmsnorm = config.use_gated_rmsnorm
+        self.nope = getattr(config, 'nope', False)
+        if self.nope:
+            logger.info(f'not using rope')
         self.is_causal = True
         self.q_proj = nn.Linear(
             config.hidden_size, 
@@ -406,7 +409,8 @@ class Qwen3NextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if not self.nope:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
